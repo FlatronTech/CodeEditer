@@ -1,2 +1,2 @@
-# CodeEditor
+# CodeEditer
 A really lightweight code editor.
