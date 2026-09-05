@@ -10,9 +10,14 @@ CodeEditer is an open source lightweight code editor for Windows. (No I don't kn
 
 ## ✨ Features
 
-====to fill out=====
+* ⚙️ Lightweight - uses fewer resources than VS code it self.
+* 🧩 Extensions - Customize your experience.
+* 🛠️ - Simple UI without any clutter.
 
 ## 📜 License
 
-This project is licensed under the **GPL-3.0 License**. Check the `LICENSE` file for more infor
-mation.
+This project is licensed under the **GPL-3.0 License**. Check the `LICENSE` file for more information.
+
+## ⚙️ Dependences
+
+Dependences used in this project can be found in ``cargo.toml`` file.
