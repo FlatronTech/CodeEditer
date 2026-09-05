@@ -1,5 +1,5 @@
 [package]
-name = "flatronix_editor"
+name = "codeediter"
 version = "0.1.0"
 edition = "2021"
 
