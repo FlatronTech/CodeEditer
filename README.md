@@ -2,7 +2,7 @@
 ![CodeEditer preview](screenshot.png)
 
 ![Rust](https://img.shields.io/badge/rust-%23000000.svg?style=for-the-badge&logo=rust&logoColor=white)
-![Version](https://img.shields.io/badge/version-1.0-green.svg?style=for-the-badge)
+![Version](https://img.shields.io/badge/version-2.0-green.svg?style=for-the-badge)
 ![License](https://img.shields.io/badge/license-GPL--3.0-blue.svg?style=for-the-badge)
 
 CodeEditer is an open source lightweight code editor for Windows. (No I don't know if Linux also works lmao)
