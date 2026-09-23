@@ -20,4 +20,4 @@ This project is licensed under the **GPL-3.0 License**. Check the `LICENSE` file
 
 ## ⚙️ Dependences
 
-Dependences used in this project can be found in ``cargo.toml`` file.
+Dependences used in this project can be found in ``Cargo.toml`` file.
