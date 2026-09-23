@@ -1,20 +1,22 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+use discord_rich_presence::{activity, DiscordIpc, DiscordIpcClient};
 use eframe::egui;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::env;
 use std::fs;
+use std::io::{Read, Write};
+use std::net::TcpListener;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread;
 use std::time::{Duration, Instant};
 use syntect::easy::HighlightLines;
 use syntect::highlighting::{Theme, ThemeSet};
 use syntect::parsing::SyntaxSet;
 use syntect::util::LinesWithEndings;
-use discord_rich_presence::{activity, DiscordIpc, DiscordIpcClient};
-
-
-// Templates
 
 #[derive(Clone, Copy, PartialEq)]
 enum NewTemplate {
@@ -31,8 +33,23 @@ enum NewTemplate {
     Batch,
 }
 
+#[derive(Clone, Copy, PartialEq, Serialize, Deserialize)]
+enum AppTheme {
+    Dark,
+    Light,
+}
 
-// Extensions
+#[derive(Clone, Copy, PartialEq, Serialize, Deserialize)]
+enum AppLanguage {
+    English,
+    Polish,
+}
+
+#[derive(Serialize, Deserialize)]
+struct EditorSettings {
+    theme: AppTheme,
+    language: AppLanguage,
+}
 
 #[derive(Clone, Serialize, Deserialize)]
 struct Extension {
@@ -43,7 +60,6 @@ struct Extension {
     author: String,
     version: String,
     installed: bool,
-
     #[serde(default)]
     verified: bool,
 }
@@ -53,8 +69,13 @@ struct ExtensionsState {
     installed_ids: Vec<String>,
 }
 
-
-// Problems
+struct LiveServerShared {
+    version: AtomicU64,
+    active_content: Mutex<String>,
+    active_path: Mutex<Option<PathBuf>>,
+    workspace_folder: Mutex<Option<PathBuf>>,
+    tabs: Mutex<HashMap<String, String>>,
+}
 
 #[derive(Clone, PartialEq)]
 #[allow(dead_code)]
@@ -71,8 +92,13 @@ struct CodeProblem {
     severity: ProblemSeverity,
 }
 
-
-// File Tab
+#[derive(Clone)]
+struct CachedDirNode {
+    path: PathBuf,
+    name: String,
+    is_dir: bool,
+    children: Vec<CachedDirNode>,
+}
 
 #[derive(Serialize, Deserialize, Clone)]
 struct FileTab {
@@ -90,9 +116,8 @@ struct FileTab {
     #[serde(skip)]
     snapshot: String,
 
-    // ⚡ Layout cache
     #[serde(skip)]
-    cached_layout: Option<(String, egui::text::LayoutJob)>,
+    cached_layout: Option<(String, String, egui::text::LayoutJob)>,
 }
 
 impl FileTab {
@@ -111,20 +136,258 @@ impl FileTab {
     }
 }
 
-// Session
-
 #[derive(Serialize, Deserialize, Default)]
 struct Session {
     tabs: Vec<FileTab>,
     active_tab_index: usize,
+    workspace_folder: Option<PathBuf>,
 }
 
+struct ResponseData {
+    body: Vec<u8>,
+    mime: &'static str,
+}
 
-// Main App
+fn start_live_server(shared: Arc<LiveServerShared>, running_flag: Arc<AtomicBool>) {
+    if running_flag.swap(true, Ordering::SeqCst) {
+        open_browser("http://localhost:8080");
+        return;
+    }
+
+    thread::spawn(move || {
+        let listener = match TcpListener::bind("127.0.0.1:8080") {
+            Ok(l) => l,
+            Err(_) => {
+                running_flag.store(false, Ordering::SeqCst);
+                return;
+            }
+        };
+        listener.set_nonblocking(true).ok();
+
+        loop {
+            if !running_flag.load(Ordering::SeqCst) {
+                break;
+            }
+
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    let shared = shared.clone();
+                    thread::spawn(move || {
+                        let mut buffer = [0u8; 8192];
+                        if let Ok(n) = stream.read(&mut buffer) {
+                            if n == 0 {
+                                return;
+                            }
+                            let req = String::from_utf8_lossy(&buffer[..n]);
+                            let mut lines = req.lines();
+                            if let Some(first_line) = lines.next() {
+                                let parts: Vec<&str> = first_line.split_whitespace().collect();
+                                if parts.len() >= 2 {
+                                    let path = parts[1];
+
+                                    if path == "/__livereload" {
+                                        let ver = shared.version.load(Ordering::SeqCst);
+                                        let response = format!(
+                                            "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nAccess-Control-Allow-Origin: *\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n{}",
+                                            ver
+                                        );
+                                        let _ = stream.write_all(response.as_bytes());
+                                        return;
+                                    }
+
+                                    let clean_path = path.trim_start_matches('/');
+                                    let mut res_data = get_response_bytes(&shared, clean_path);
+
+                                    if res_data.mime.starts_with("text/html") {
+                                        let mut body_str = String::from_utf8_lossy(&res_data.body).into_owned();
+                                        let script = r#"
+<script>
+(function() {
+    let lastVer = null;
+    setInterval(async () => {
+        try {
+            let res = await fetch('/__livereload');
+            if (res.ok) {
+                let ver = await res.text();
+                if (lastVer !== null && lastVer !== ver) {
+                    location.reload();
+                }
+                lastVer = ver;
+            }
+        } catch(e) {}
+    }, 400);
+})();
+</script>
+"#;
+                                        if let Some(idx) = body_str.rfind("</body>") {
+                                            body_str.insert_str(idx, script);
+                                        } else {
+                                            body_str.push_str(script);
+                                        }
+                                        res_data.body = body_str.into_bytes();
+                                    }
+
+                                    let header = format!(
+                                        "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n",
+                                        res_data.mime,
+                                        res_data.body.len()
+                                    );
+                                    let _ = stream.write_all(header.as_bytes());
+                                    let _ = stream.write_all(&res_data.body);
+                                }
+                            }
+                        }
+                    });
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(50));
+                }
+                Err(_) => {
+                    break;
+                }
+            }
+        }
+    });
+
+    open_browser("http://localhost:8080");
+}
+
+fn get_response_bytes(shared: &LiveServerShared, req_path: &str) -> ResponseData {
+    let tabs = shared.tabs.lock().unwrap();
+    let active_content = shared.active_content.lock().unwrap().clone();
+    let active_path = shared.active_path.lock().unwrap().clone();
+    let workspace_folder = shared.workspace_folder.lock().unwrap().clone();
+
+    let clean_path = req_path.trim_start_matches('/');
+    let is_index = clean_path.is_empty() || clean_path == "index.html";
+
+    if is_index {
+        if let Some(path) = active_path.as_ref() {
+            let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
+            if ext.eq_ignore_ascii_case("html") || ext.eq_ignore_ascii_case("htm") {
+                return ResponseData {
+                    body: active_content.into_bytes(),
+                    mime: "text/html; charset=utf-8",
+                };
+            }
+        }
+
+        if let Some(ref wf) = workspace_folder {
+            let index_path = wf.join("index.html");
+            if index_path.is_file() {
+                if let Ok(bytes) = fs::read(&index_path) {
+                    return ResponseData {
+                        body: bytes,
+                        mime: "text/html; charset=utf-8",
+                    };
+                }
+            }
+        }
+
+        for (name, content) in tabs.iter() {
+            if name.ends_with(".html") || name.ends_with(".htm") {
+                return ResponseData {
+                    body: content.as_bytes().to_vec(),
+                    mime: "text/html; charset=utf-8",
+                };
+            }
+        }
+
+        return ResponseData {
+            body: b"<!DOCTYPE html><html><head><title>Live Server</title></head><body><h1>Live Server Running</h1><p>No HTML file active or index.html found in open folder.</p></body></html>".to_vec(),
+            mime: "text/html; charset=utf-8",
+        };
+    }
+
+    if let Some(content) = tabs.get(clean_path) {
+        return ResponseData {
+            body: content.as_bytes().to_vec(),
+            mime: get_mime(clean_path),
+        };
+    }
+
+    for (name, content) in tabs.iter() {
+        if Path::new(name).file_name().and_then(|s| s.to_str()) == Some(clean_path) {
+            return ResponseData {
+                body: content.as_bytes().to_vec(),
+                mime: get_mime(clean_path),
+            };
+        }
+    }
+
+    if let Some(ref wf) = workspace_folder {
+        let file_path = wf.join(clean_path);
+        if file_path.is_file() {
+            if let Ok(bytes) = fs::read(&file_path) {
+                return ResponseData {
+                    body: bytes,
+                    mime: get_mime(clean_path),
+                };
+            }
+        }
+    }
+
+    if let Some(parent) = active_path.as_ref().and_then(|p| p.parent()) {
+        let file_path = parent.join(clean_path);
+        if file_path.is_file() {
+            if let Ok(bytes) = fs::read(&file_path) {
+                return ResponseData {
+                    body: bytes,
+                    mime: get_mime(clean_path),
+                };
+            }
+        }
+    }
+
+    ResponseData {
+        body: format!("<h1>404 Not Found: {}</h1>", clean_path).into_bytes(),
+        mime: "text/html; charset=utf-8",
+    }
+}
+
+fn get_mime(path_str: &str) -> &'static str {
+    let ext = Path::new(path_str)
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+
+    match ext.as_str() {
+        "html" | "htm" => "text/html; charset=utf-8",
+        "css" => "text/css; charset=utf-8",
+        "js" | "mjs" | "cjs" => "application/javascript; charset=utf-8",
+        "json" => "application/json; charset=utf-8",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "svg" => "image/svg+xml",
+        "ico" => "image/x-icon",
+        _ => "text/plain; charset=utf-8",
+    }
+}
+
+fn open_browser(url: &str) {
+    #[cfg(target_os = "windows")]
+    {
+        let _ = std::process::Command::new("cmd")
+            .args(["/C", "start", url])
+            .spawn();
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = std::process::Command::new("open").arg(url).spawn();
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        let _ = std::process::Command::new("xdg-open").arg(url).spawn();
+    }
+}
 
 struct FlatronixEditor {
     tabs: Vec<FileTab>,
     active_tab: usize,
+    workspace_folder: Option<PathBuf>,
+    dir_cache: Vec<CachedDirNode>,
+    last_dir_refresh: Instant,
     syntax_set: SyntaxSet,
     theme: Theme,
     icons: HashMap<String, egui::TextureHandle>,
@@ -132,18 +395,26 @@ struct FlatronixEditor {
     editing_tab: Option<usize>,
     editing_name: String,
     rename_focus_requested: bool,
+    
+    show_search: bool,
+    search_query: String,
 
-    // Discord RPC
     discord_client: Option<DiscordIpcClient>,
     discord_start_time: i64,
     last_discord_update: Instant,
 
-    // Extensions
     extensions: Vec<Extension>,
     show_extensions_window: bool,
     extension_page: Option<String>,
 
-    // Problems
+    show_settings_window: bool,
+    app_theme: AppTheme,
+    app_lang: AppLanguage,
+    was_focused: bool,
+
+    live_server_shared: Arc<LiveServerShared>,
+    live_server_running: Arc<AtomicBool>,
+
     problems: Vec<CodeProblem>,
     problems_cache_content: String,
     problems_cache_ext: String,
@@ -154,19 +425,24 @@ impl FlatronixEditor {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         setup_fonts(&cc.egui_ctx);
 
-        cc.egui_ctx.set_visuals(egui::Visuals::dark());
-        cc.egui_ctx.style_mut(|style| {
-            style.spacing.item_spacing = egui::vec2(6.0, 6.0);
-            style.spacing.button_padding = egui::vec2(8.0, 4.0);
-        });
-
         let syntax_set = SyntaxSet::load_defaults_newlines();
         let theme_set = ThemeSet::load_defaults();
         let theme = theme_set.themes["base16-ocean.dark"].clone();
 
+        let shared = Arc::new(LiveServerShared {
+            version: AtomicU64::new(1),
+            active_content: Mutex::new(String::new()),
+            active_path: Mutex::new(None),
+            workspace_folder: Mutex::new(None),
+            tabs: Mutex::new(HashMap::new()),
+        });
+
         let mut app = Self {
             tabs: vec![],
             active_tab: 0,
+            workspace_folder: None,
+            dir_cache: vec![],
+            last_dir_refresh: Instant::now() - Duration::from_secs(10),
             syntax_set,
             theme,
             icons: HashMap::new(),
@@ -174,6 +450,9 @@ impl FlatronixEditor {
             editing_tab: None,
             editing_name: String::new(),
             rename_focus_requested: false,
+            
+            show_search: false,
+            search_query: String::new(),
 
             discord_client: None,
             discord_start_time: std::time::SystemTime::now()
@@ -186,8 +465,8 @@ impl FlatronixEditor {
                 Extension {
                     id: "discord_rpc".to_string(),
                     name: "Discord RPC".to_string(),
-                    description: "Show your friends on Discord what are you coding! 🎮".to_string(),
-                    long_description: "This extension connects CodeEditer with Discord Rich Presence.\n\nYour friends will see:\n• What file you're editing\n• What language you're using\n• How many lines/characters you wrote\n• Whether your file is saved or not\n\nRequires Discord desktop app to be running.".to_string(),
+                    description: "Show your friends on Discord what are you coding!".to_string(),
+                    long_description: "This extension connects CodeEditer with your Discord!\n\nYour friends will see:\n• What file you're editing\n• What language you're using\n• How many lines/characters you wrote\n•\n\nRequires Discord desktop app to be running.".to_string(),
                     author: "Flatronix".to_string(),
                     version: "1.0.0".to_string(),
                     installed: false,
@@ -196,11 +475,11 @@ impl FlatronixEditor {
                 Extension {
                     id: "live_server".to_string(),
                     name: "Live Server".to_string(),
-                    description: "Live preview for HTML/CSS/JS files (coming soon) 🚀".to_string(),
-                    long_description: "This extension will provide a live preview server for HTML, CSS and JavaScript files.\n\nFeatures (planned):\n• Auto-reload on save\n• Local server on port 5500\n• Browser sync\n\n⚠️ This extension is still in development.".to_string(),
+                    description: "Live preview server for HTML/CSS/JS on port 8080".to_string(),
+                    long_description: "Provides a live preview server on http://localhost:8080.\n\nFeatures:\n• Auto-reloads on file save or when leaving application window\n• Opens default browser automatically\n• Supports HTML, CSS, JavaScript".to_string(),
                     author: "Flatronix".to_string(),
-                    version: "0.0.1-alpha".to_string(),
-                    installed: false,
+                    version: "1.0.0".to_string(),
+                    installed: true,
                     verified: true,
                 },
             ],
@@ -208,26 +487,41 @@ impl FlatronixEditor {
             show_extensions_window: false,
             extension_page: None,
 
+            show_settings_window: false,
+            app_theme: AppTheme::Dark,
+            app_lang: AppLanguage::English,
+            was_focused: true,
+
+            live_server_shared: shared,
+            live_server_running: Arc::new(AtomicBool::new(false)),
+
             problems: vec![],
             problems_cache_content: String::new(),
             problems_cache_ext: String::new(),
             show_problems_panel: false,
         };
 
+        app.load_settings();
         app.load_icons(&cc.egui_ctx);
         app.load_session();
         app.load_extensions_state();
 
-        // Connect Discord if extension was previously installed
+        match app.app_theme {
+            AppTheme::Dark => cc.egui_ctx.set_visuals(egui::Visuals::dark()),
+            AppTheme::Light => cc.egui_ctx.set_visuals(egui::Visuals::light()),
+        }
+
         if app.is_extension_installed("discord_rpc") {
             app.init_discord();
         }
 
-        // Open files from CLI args (Windows "Open with")
         let args: Vec<PathBuf> = env::args().skip(1).map(PathBuf::from).collect();
         for arg in args {
             if arg.is_file() {
                 app.open_path(&arg);
+            } else if arg.is_dir() {
+                app.workspace_folder = Some(arg.clone());
+                *app.live_server_shared.workspace_folder.lock().unwrap() = Some(arg);
             }
         }
 
@@ -235,15 +529,39 @@ impl FlatronixEditor {
             app.tabs.push(FileTab::new(
                 None,
                 "new_file.txt".to_string(),
-                "Hi! To start try creating a new file using the file menu! 👋\n".to_string(),
+                "Hi! To start try creating a new file using the File menu!\n".to_string(),
             ));
         }
 
         app
     }
 
+    fn save_settings(&self) {
+        if let Some(proj_dir) = directories::ProjectDirs::from("com", "folder", "editor") {
+            let dir = proj_dir.data_dir();
+            if fs::create_dir_all(dir).is_ok() {
+                let settings = EditorSettings {
+                    theme: self.app_theme,
+                    language: self.app_lang,
+                };
+                if let Ok(json) = serde_json::to_string_pretty(&settings) {
+                    let _ = fs::write(dir.join("settings.json"), json);
+                }
+            }
+        }
+    }
 
-    // Extensions helpers
+    fn load_settings(&mut self) {
+        if let Some(proj_dir) = directories::ProjectDirs::from("com", "folder", "editor") {
+            let path = proj_dir.data_dir().join("settings.json");
+            if let Ok(data) = fs::read_to_string(path) {
+                if let Ok(settings) = serde_json::from_str::<EditorSettings>(&data) {
+                    self.app_theme = settings.theme;
+                    self.app_lang = settings.language;
+                }
+            }
+        }
+    }
 
     fn is_extension_installed(&self, id: &str) -> bool {
         self.extensions.iter().any(|e| e.id == id && e.installed)
@@ -282,33 +600,22 @@ impl FlatronixEditor {
         }
     }
 
-
-    // Discord RPC
-
     fn init_discord(&mut self) {
         let app_id = "1545533503519596594";
         let mut client = DiscordIpcClient::new(app_id);
 
-        match client.connect() {
-            Ok(_) => {
-                println!("Discord RPC: Connected!");
-                self.discord_client = Some(client);
-            }
-            Err(e) => {
-                println!("Discord RPC: Cannot connect: {}", e);
-            }
+        if client.connect().is_ok() {
+            self.discord_client = Some(client);
         }
     }
 
     fn disconnect_discord(&mut self) {
         if let Some(mut client) = self.discord_client.take() {
             let _ = client.close();
-            println!("🔌 Discord RPC: Disconnected");
         }
     }
 
     fn update_discord_presence(&mut self) {
-        // Only if extension is installed
         if !self.is_extension_installed("discord_rpc") {
             return;
         }
@@ -388,16 +695,23 @@ impl FlatronixEditor {
             )
             .timestamps(activity::Timestamps::new().start(self.discord_start_time));
 
-        if let Err(e) = client.set_activity(activity) {
-            println!("Discord RPC: Update error: {}", e);
-
-            if client.connect().is_ok() {
-                println!("Discord RPC: Reconnected");
-            }
+        if client.set_activity(activity).is_err() {
+            let _ = client.connect();
         }
     }
 
-    // Problems
+    fn is_active_tab_html(&self) -> bool {
+        if let Some(tab) = self.tabs.get(self.active_tab) {
+            let ext = Path::new(&tab.name)
+                .extension()
+                .and_then(|s| s.to_str())
+                .unwrap_or("")
+                .to_lowercase();
+            ext == "html" || ext == "htm"
+        } else {
+            false
+        }
+    }
 
     fn update_problems(&mut self) {
         let (content, ext) = if let Some(tab) = self.tabs.get(self.active_tab) {
@@ -422,11 +736,8 @@ impl FlatronixEditor {
         self.problems = check_code_problems(&content, &ext);
     }
 
-
-    // Icons
-
     fn load_icons(&mut self, ctx: &egui::Context) {
-        let icon_map: [(&str, &str); 13] = [
+        let icon_map: [(&str, &str); 14] = [
             ("py", "icons/py.ico"),
             ("cplus", "icons/cplus.ico"),
             ("html", "html.ico"),
@@ -440,7 +751,7 @@ impl FlatronixEditor {
             ("txt", "txt.ico"),
             ("php", "php.ico"),
             ("verified", "icons/verified.ico"),
-        ];
+         ];
 
         for (key, path) in icon_map.iter() {
             let candidates = [path.to_string(), format!("icons/{}", path)];
@@ -468,6 +779,7 @@ impl FlatronixEditor {
                 let session = Session {
                     tabs: self.tabs.clone(),
                     active_tab_index: self.active_tab,
+                    workspace_folder: self.workspace_folder.clone(),
                 };
 
                 if let Ok(json) = serde_json::to_string_pretty(&session) {
@@ -495,6 +807,9 @@ impl FlatronixEditor {
                             }
                         }
                     }
+                    self.workspace_folder = session.workspace_folder.clone();
+                    *self.live_server_shared.workspace_folder.lock().unwrap() =
+                        session.workspace_folder;
                 }
             }
         }
@@ -635,6 +950,7 @@ impl FlatronixEditor {
         self.active_tab = self.tabs.len().saturating_sub(1);
         self.editing_tab = None;
         self.rename_focus_requested = false;
+        self.last_dir_refresh = Instant::now() - Duration::from_secs(10);
     }
 
     fn unique_name(&self, base: &str, ext: &str) -> String {
@@ -702,6 +1018,7 @@ impl FlatronixEditor {
                 }
             }
         }
+        self.last_dir_refresh = Instant::now() - Duration::from_secs(10);
     }
 
     fn save_active(&mut self) {
@@ -715,6 +1032,8 @@ impl FlatronixEditor {
                 tab.path = Some(path);
                 tab.is_modified = false;
                 tab.snapshot = tab.content.clone();
+                self.live_server_shared.version.fetch_add(1, Ordering::SeqCst);
+                self.last_dir_refresh = Instant::now() - Duration::from_secs(10);
             }
         }
     }
@@ -784,17 +1103,38 @@ impl FlatronixEditor {
     }
 }
 
-     // GUI
-
 impl eframe::App for FlatronixEditor {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // 🎮 Discord RPC
-        self.update_discord_presence();
+        match self.app_theme {
+            AppTheme::Dark => ctx.set_visuals(egui::Visuals::dark()),
+            AppTheme::Light => ctx.set_visuals(egui::Visuals::light()),
+        }
 
-        // Problems
+        let is_focused = ctx.input(|i| i.raw.focused);
+        if self.was_focused && !is_focused {
+            self.save_active();
+        }
+        self.was_focused = is_focused;
+
+        {
+            let mut tabs_map = self.live_server_shared.tabs.lock().unwrap();
+            tabs_map.clear();
+            for tab in &self.tabs {
+                tabs_map.insert(tab.name.clone(), tab.content.clone());
+            }
+
+            if let Some(tab) = self.tabs.get(self.active_tab) {
+                *self.live_server_shared.active_content.lock().unwrap() = tab.content.clone();
+                *self.live_server_shared.active_path.lock().unwrap() = tab.path.clone();
+            } else {
+                self.live_server_shared.active_content.lock().unwrap().clear();
+                *self.live_server_shared.active_path.lock().unwrap() = None;
+            }
+        }
+
+        self.update_discord_presence();
         self.update_problems();
 
-        // Drag & drop
         let mut dropped_paths: Vec<PathBuf> = Vec::new();
         ctx.input(|i| {
             for file in &i.raw.dropped_files {
@@ -805,24 +1145,32 @@ impl eframe::App for FlatronixEditor {
         });
 
         for path in dropped_paths {
-            self.open_path(&path);
+            if path.is_dir() {
+                self.workspace_folder = Some(path.clone());
+                *self.live_server_shared.workspace_folder.lock().unwrap() = Some(path);
+                self.last_dir_refresh = Instant::now() - Duration::from_secs(10);
+            } else {
+                self.open_path(&path);
+            }
         }
 
         let mut create_template_cmd: Option<NewTemplate> = None;
         let mut save_current = false;
         let mut close_current = false;
         let mut open_file_dialog = false;
+        let mut open_folder_dialog = false;
 
         let mut new_shortcut = false;
         let mut undo_shortcut = false;
         let mut redo_shortcut = false;
         let mut copy_all_shortcut = false;
+        let mut toggle_search = false;
         let mut paste_all_text: Option<String> = None;
 
         let editing_name_mode = self.editing_tab.is_some();
         let ui_has_focus = ctx.memory(|mem| mem.focused().is_some());
+        let mut focus_search_requested = false;
 
-        // Keybinds
         ctx.input_mut(|i| {
             if i.modifiers.ctrl {
                 if i.key_pressed(egui::Key::S) {
@@ -833,6 +1181,12 @@ impl eframe::App for FlatronixEditor {
                 if i.key_pressed(egui::Key::N) {
                     new_shortcut = true;
                     i.consume_key(egui::Modifiers::CTRL, egui::Key::N);
+                }
+                
+                if i.key_pressed(egui::Key::F) {
+                    toggle_search = true;
+                    focus_search_requested = true;
+                    i.consume_key(egui::Modifiers::CTRL, egui::Key::F);
                 }
 
                 if i.key_pressed(egui::Key::Z) {
@@ -867,6 +1221,10 @@ impl eframe::App for FlatronixEditor {
                 }
             }
         });
+        
+        if toggle_search {
+            self.show_search = true;
+        }
 
         if new_shortcut {
             create_template_cmd = Some(NewTemplate::Plain);
@@ -892,74 +1250,67 @@ impl eframe::App for FlatronixEditor {
             }
         }
 
-
-        // Menu bar
+        let is_pl = self.app_lang == AppLanguage::Polish;
 
         egui::TopBottomPanel::top("menu_bar").show(ctx, |ui| {
             egui::menu::bar(ui, |ui| {
-                ui.menu_button("File", |ui| {
-                    if ui.button("New File").clicked() {
+                ui.menu_button(if is_pl { "Plik" } else { "File" }, |ui| {
+                    if ui.button(if is_pl { "Nowy Plik" } else { "New File" }).clicked() {
                         create_template_cmd = Some(NewTemplate::Plain);
                         ui.close_menu();
                     }
 
-                    // Open File
-                    if ui.button("Open File").clicked() {
+                    if ui.button(if is_pl { "Otwórz Plik" } else { "Open File" }).clicked() {
                         open_file_dialog = true;
                         ui.close_menu();
                     }
 
-                    ui.menu_button("Templates", |ui| {
+                    if ui.button(if is_pl { "Otwórz Folder" } else { "Open Folder" }).clicked() {
+                        open_folder_dialog = true;
+                        ui.close_menu();
+                    }
+
+                    ui.menu_button(if is_pl { "Szablony" } else { "Templates" }, |ui| {
                         if ui.button("TXT").clicked() {
                             create_template_cmd = Some(NewTemplate::Plain);
                             ui.close_menu();
                         }
-
                         if ui.button("Python").clicked() {
                             create_template_cmd = Some(NewTemplate::Python);
                             ui.close_menu();
                         }
-
                         if ui.button("C++").clicked() {
                             create_template_cmd = Some(NewTemplate::Cpp);
                             ui.close_menu();
                         }
-
                         if ui.button("Rust").clicked() {
                             create_template_cmd = Some(NewTemplate::Rust);
                             ui.close_menu();
                         }
-
                         if ui.button("C").clicked() {
                             create_template_cmd = Some(NewTemplate::C);
                             ui.close_menu();
                         }
-
                         if ui.button("C#").clicked() {
                             create_template_cmd = Some(NewTemplate::CSharp);
                             ui.close_menu();
                         }
-
                         if ui.button("JavaScript").clicked() {
                             create_template_cmd = Some(NewTemplate::JavaScript);
                             ui.close_menu();
                         }
-
                         if ui.button("Java").clicked() {
                             create_template_cmd = Some(NewTemplate::Java);
                             ui.close_menu();
                         }
-
                         if ui.button("Go").clicked() {
                             create_template_cmd = Some(NewTemplate::Go);
                             ui.close_menu();
                         }
-
                         if ui.button("HTML").clicked() {
                             create_template_cmd = Some(NewTemplate::Html);
                             ui.close_menu();
                         }
-
                         if ui.button("Batch").clicked() {
                             create_template_cmd = Some(NewTemplate::Batch);
                             ui.close_menu();
@@ -968,20 +1319,55 @@ impl eframe::App for FlatronixEditor {
 
                     ui.separator();
 
-                    if ui.button("Save").clicked() {
+                    if ui.button(if is_pl { "Zapisz" } else { "Save" }).clicked() {
                         save_current = true;
                         ui.close_menu();
                     }
 
-                    if ui.button("Close Active Tab").clicked() {
+                    if ui.button(if is_pl { "Zamknij kartę" } else { "Close Active Tab" }).clicked() {
                         close_current = true;
                         ui.close_menu();
                     }
                 });
 
-                // Extensions button
-                if ui.button("Extensions").clicked() {
+                ui.menu_button(if is_pl { "Edycja" } else { "Edit" }, |ui| {
+                    if ui.button(if is_pl { "Szukaj (Ctrl+F)" } else { "Search (Ctrl+F)" }).clicked() {
+                        self.show_search = true;
+                        focus_search_requested = true;
+                        ui.close_menu();
+                    }
+                });
+
+                if ui.button(if is_pl { "Rozszerzenia" } else { "Extensions" }).clicked() {
                     self.show_extensions_window = !self.show_extensions_window;
+                }
+
+                if ui.button(if is_pl { "Ustawienia" } else { "Settings" }).clicked() {
+                    self.show_settings_window = !self.show_settings_window;
+                }
+
+                if self.is_extension_installed("live_server")
+                    && self.workspace_folder.is_some()
+                    && self.is_active_tab_html()
+                {
+                    let ls_label = if self.live_server_running.load(Ordering::SeqCst) {
+                        if is_pl { "⏹ Zatrzymaj Live Server" } else { "⏹ Stop Live Server" }
+                    } else if is_pl {
+                        "▶ Uruchom Live Server"
+                    } else {
+                        "▶ Start Live Server"
+                    };
+
+                    if ui.button(ls_label).clicked() {
+                        if self.live_server_running.load(Ordering::SeqCst) {
+                            self.live_server_running.store(false, Ordering::SeqCst);
+                        } else {
+                            start_live_server(
+                                self.live_server_shared.clone(),
+                                self.live_server_running.clone(),
+                            );
+                        }
+                    }
                 }
 
                 ui.separator();
@@ -989,18 +1375,25 @@ impl eframe::App for FlatronixEditor {
             });
         });
 
-        // Open File dialog
         if open_file_dialog {
             if let Some(path) = rfd::FileDialog::new()
-                .set_title("Open File")
+                .set_title(if is_pl { "Otwórz Plik" } else { "Open File" })
                 .pick_file()
             {
                 self.open_path(&path);
             }
         }
 
-        
-        // Extensions Window
+        if open_folder_dialog {
+            if let Some(path) = rfd::FileDialog::new()
+                .set_title(if is_pl { "Otwórz Folder" } else { "Open Folder" })
+                .pick_folder()
+            {
+                self.workspace_folder = Some(path.clone());
+                *self.live_server_shared.workspace_folder.lock().unwrap() = Some(path);
+                self.last_dir_refresh = Instant::now() - Duration::from_secs(10);
+            }
+        }
 
         if self.show_extensions_window {
             let mut extension_action: Option<(String, bool)> = None;
@@ -1015,7 +1408,7 @@ impl eframe::App for FlatronixEditor {
             ctx.show_viewport_immediate(
                 egui::ViewportId::from_hash_of("extensions"),
                 egui::ViewportBuilder::default()
-                    .with_title("Extensions")
+                    .with_title(if is_pl { "Rozszerzenia" } else { "Extensions" })
                     .with_inner_size([480.0, 560.0])
                     .with_min_inner_size([380.0, 420.0]),
                 |ctx, _class| {
@@ -1023,7 +1416,11 @@ impl eframe::App for FlatronixEditor {
                         close_requested = true;
                     }
 
-                    ctx.set_visuals(egui::Visuals::dark());
+                    match self.app_theme {
+                        AppTheme::Dark => ctx.set_visuals(egui::Visuals::dark()),
+                        AppTheme::Light => ctx.set_visuals(egui::Visuals::light()),
+                    }
+
                     ctx.style_mut(|style| {
                         style.spacing.item_spacing = egui::vec2(6.0, 6.0);
                         style.spacing.button_padding = egui::vec2(8.0, 4.0);
@@ -1031,7 +1428,6 @@ impl eframe::App for FlatronixEditor {
 
                     egui::CentralPanel::default().show(ctx, |ui| {
                         match &current_page {
-                            // ── Extension detail page ──
                             Some(page_id) => {
                                 let ext_data = extensions_clone
                                     .iter()
@@ -1039,7 +1435,7 @@ impl eframe::App for FlatronixEditor {
                                     .cloned();
 
                                 if let Some(ext) = ext_data {
-                                    if ui.button("<- Back to list").clicked() {
+                                    if ui.button(if is_pl { "<- Powrót" } else { "<- Back to list" }).clicked() {
                                         go_back = true;
                                     }
 
@@ -1048,13 +1444,12 @@ impl eframe::App for FlatronixEditor {
                                     ui.add_space(4.0);
 
                                     ui.horizontal(|ui| {
-                                        ui.label("Version:");
+                                        ui.label(if is_pl { "Wersja:" } else { "Version:" });
                                         ui.label(egui::RichText::new(&ext.version).strong());
                                     });
 
-   
                                     ui.horizontal(|ui| {
-                                        ui.label("Author:");
+                                        ui.label(if is_pl { "Wydawca:" } else { "Publisher:" });
                                         ui.label(egui::RichText::new(&ext.author).strong());
 
                                         if ext.verified {
@@ -1083,12 +1478,12 @@ impl eframe::App for FlatronixEditor {
 
                                         if ext.installed {
                                             ui.label(
-                                                egui::RichText::new("Installed")
+                                                egui::RichText::new(if is_pl { "Zainstalowano" } else { "Installed" })
                                                     .color(egui::Color32::from_rgb(100, 220, 100)),
                                             );
                                         } else {
                                             ui.label(
-                                                egui::RichText::new("Not installed")
+                                                egui::RichText::new(if is_pl { "Niezainstalowano" } else { "Not installed" })
                                                     .color(egui::Color32::from_rgb(220, 100, 100)),
                                             );
                                         }
@@ -1101,20 +1496,19 @@ impl eframe::App for FlatronixEditor {
                                     ui.separator();
 
                                     if ext.installed {
-                                        if ui.button("Uninstall").clicked() {
+                                        if ui.button(if is_pl { "Odinstaluj" } else { "Uninstall" }).clicked() {
                                             extension_action = Some((ext.id.clone(), false));
                                         }
-                                    } else if ui.button("Install").clicked() {
+                                    } else if ui.button(if is_pl { "Zainstaluj" } else { "Install" }).clicked() {
                                         extension_action = Some((ext.id.clone(), true));
                                     }
-                                } else if ui.button("<- Back to list").clicked() {
+                                } else if ui.button(if is_pl { "<- Powrót" } else { "<- Back to list" }).clicked() {
                                     go_back = true;
                                 }
                             }
 
-                            // ── Extensions list ──
                             None => {
-                                ui.label("Extensions");
+                                ui.label(if is_pl { "Rozszerzenia" } else { "Extensions" });
                                 ui.separator();
 
                                 for ext in extensions_clone.iter() {
@@ -1133,7 +1527,7 @@ impl eframe::App for FlatronixEditor {
                                             ui.with_layout(
                                                 egui::Layout::right_to_left(egui::Align::Center),
                                                 |ui| {
-                                                    if ui.button("Details ->").clicked() {
+                                                    if ui.button(if is_pl { "Szczegóły ->" } else { "Details ->" }).clicked() {
                                                         open_page = Some(ext.id.clone());
                                                     }
                                                 },
@@ -1151,7 +1545,6 @@ impl eframe::App for FlatronixEditor {
                 },
             );
 
-
             if go_back {
                 self.extension_page = None;
             }
@@ -1160,7 +1553,6 @@ impl eframe::App for FlatronixEditor {
                 self.extension_page = Some(id);
             }
 
-            // Install / Uninstall extensions
             let mut state_changed = false;
             let mut discord_action: Option<bool> = None;
 
@@ -1175,11 +1567,9 @@ impl eframe::App for FlatronixEditor {
                 }
             }
 
-
             if close_requested {
                 self.show_extensions_window = false;
             }
-
 
             if let Some(install) = discord_action {
                 if install {
@@ -1189,14 +1579,150 @@ impl eframe::App for FlatronixEditor {
                 }
             }
 
-
             if state_changed {
                 self.save_extensions_state();
             }
         }
 
+        if self.show_settings_window {
+            let mut close_requested = false;
+            let mut current_theme = self.app_theme;
+            let mut current_lang = self.app_lang;
 
-        // Tab bar
+            ctx.show_viewport_immediate(
+                egui::ViewportId::from_hash_of("settings"),
+                egui::ViewportBuilder::default()
+                    .with_title(if is_pl { "Ustawienia" } else { "Settings" })
+                    .with_inner_size([380.0, 240.0])
+                    .with_resizable(false),
+                |ctx, _class| {
+                    if ctx.input(|i| i.viewport().close_requested()) {
+                        close_requested = true;
+                    }
+
+                    match current_theme {
+                        AppTheme::Dark => ctx.set_visuals(egui::Visuals::dark()),
+                        AppTheme::Light => ctx.set_visuals(egui::Visuals::light()),
+                    }
+
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        ui.heading(if current_lang == AppLanguage::Polish { "Ustawienia" } else { "Settings" });
+                        ui.separator();
+                        ui.add_space(8.0);
+
+                        ui.label(if current_lang == AppLanguage::Polish { "Motyw:" } else { "Theme:" });
+                        ui.horizontal(|ui| {
+                            ui.radio_value(
+                                &mut current_theme,
+                                AppTheme::Dark,
+                                if current_lang == AppLanguage::Polish { "Ciemny (domyślny)" } else { "Dark (default)" },
+                            );
+                            ui.radio_value(
+                                &mut current_theme,
+                                AppTheme::Light,
+                                if current_lang == AppLanguage::Polish { "Jasny" } else { "Light" },
+                            );
+                        });
+
+                        ui.add_space(12.0);
+
+                        ui.label(if current_lang == AppLanguage::Polish { "Język:" } else { "Language:" });
+                        ui.horizontal(|ui| {
+                            ui.radio_value(&mut current_lang, AppLanguage::English, "English");
+                            ui.radio_value(&mut current_lang, AppLanguage::Polish, "Polski");
+                        });
+                    });
+                },
+            );
+
+            if close_requested {
+                self.show_settings_window = false;
+            }
+
+            if current_theme != self.app_theme || current_lang != self.app_lang {
+                self.app_theme = current_theme;
+                self.app_lang = current_lang;
+                self.save_settings();
+            }
+        }
+
+        if let Some(ref wf) = self.workspace_folder {
+            let mut file_to_open: Option<PathBuf> = None;
+            let mut close_folder = false;
+            
+            if self.last_dir_refresh.elapsed() > Duration::from_secs(3) {
+                self.dir_cache = build_dir_tree(wf);
+                self.last_dir_refresh = Instant::now();
+            }
+
+            egui::SidePanel::left("file_explorer_panel")
+                .default_width(220.0)
+                .min_width(160.0)
+                .max_width(350.0)
+                .show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        let folder_name = wf
+                            .file_name()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or("Folder");
+
+                        ui.heading(format!("📂 {}", folder_name));
+
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui
+                                .small_button("❌")
+                                .on_hover_text(if is_pl { "Zamknij folder" } else { "Close folder" })
+                                .clicked()
+                            {
+                                close_folder = true;
+                            }
+                        });
+                    });
+
+                    ui.separator();
+
+                    egui::ScrollArea::both()
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            render_cached_dir_tree(ui, &self.dir_cache, &self.icons, &mut file_to_open);
+                        });
+                });
+
+            if close_folder {
+                self.workspace_folder = None;
+                *self.live_server_shared.workspace_folder.lock().unwrap() = None;
+                self.dir_cache.clear();
+            }
+
+            if let Some(path) = file_to_open {
+                self.open_path(&path);
+            }
+        }
+
+        if self.show_search {
+            egui::TopBottomPanel::top("search_panel").show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(if is_pl { "Szukaj:" } else { "Search:" });
+                    let response = ui.add(
+                        egui::TextEdit::singleline(&mut self.search_query)
+                            .desired_width(200.0)
+                    );
+                    
+                    if focus_search_requested {
+                        response.request_focus();
+                    }
+                    
+                    if ui.button(if is_pl { "Wyczyść" } else { "Clear" }).clicked() {
+                        self.search_query.clear();
+                        response.request_focus();
+                    }
+                    if ui.button(if is_pl { "Zamknij" } else { "Close" }).clicked() {
+                        self.show_search = false;
+                        self.search_query.clear();
+                    }
+                });
+            });
+        }
 
         let mut selected_tab: Option<usize> = None;
         let mut tab_to_close: Option<usize> = None;
@@ -1310,16 +1836,13 @@ impl eframe::App for FlatronixEditor {
             });
         });
 
-
-        // Problems panel (above status bar)
-
         if self.show_problems_panel {
             egui::TopBottomPanel::bottom("problems_panel")
                 .min_height(120.0)
                 .max_height(250.0)
                 .show(ctx, |ui| {
                     ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new("Problems").strong());
+                        ui.label(egui::RichText::new(if is_pl { "Problemy" } else { "Problems" }).strong());
 
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if ui.small_button("X").clicked() {
@@ -1335,7 +1858,7 @@ impl eframe::App for FlatronixEditor {
                         .show(ui, |ui| {
                             if self.problems.is_empty() {
                                 ui.label(
-                                    egui::RichText::new("No problems detected")
+                                    egui::RichText::new(if is_pl { "Nie wykryto problemów" } else { "No problems detected" })
                                         .color(egui::Color32::from_rgb(100, 220, 100)),
                                 );
                             } else {
@@ -1354,8 +1877,11 @@ impl eframe::App for FlatronixEditor {
 
                                     ui.label(
                                         egui::RichText::new(format!(
-                                            "{} Line {}: {}",
-                                            icon, problem.line, problem.message
+                                            "{} {} {}: {}",
+                                            icon,
+                                            if is_pl { "Linia" } else { "Line" },
+                                            problem.line,
+                                            problem.message
                                         ))
                                         .color(color),
                                     );
@@ -1364,9 +1890,6 @@ impl eframe::App for FlatronixEditor {
                         });
                 });
         }
-
-
-        // Status bar
 
         egui::TopBottomPanel::bottom("status_bar").show(ctx, |ui| {
             ui.horizontal(|ui| {
@@ -1385,27 +1908,27 @@ impl eframe::App for FlatronixEditor {
                     ui.separator();
                     ui.label(format!("{}", lang));
                     ui.separator();
-                    ui.label(format!("Lines: {}", lines));
+                    ui.label(format!("{}: {}", if is_pl { "Linii" } else { "Lines" }, lines));
                     ui.separator();
-                    ui.label(format!("Characters: {}", chars));
+                    ui.label(format!("{}: {}", if is_pl { "Znaków" } else { "Characters" }, chars));
                     ui.separator();
 
                     if tab.is_modified {
-                        ui.label("Modified");
+                        ui.label(if is_pl { "Zmodyfikowano" } else { "Modified" });
                     } else {
-                        ui.label("Saved");
+                        ui.label(if is_pl { "Zapisano" } else { "Saved" });
                     }
                 } else {
-                    ui.label("No opened files");
+                    ui.label(if is_pl { "Brak otwartych plików" } else { "No opened files" });
                 }
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let problems_count = self.problems.len();
 
                     let problems_label = if problems_count == 0 {
-                        "No problems".to_string()
+                        if is_pl { "Brak problemów".to_string() } else { "No problems".to_string() }
                     } else {
-                        format!("{} problem(s)", problems_count)
+                        format!("{} {}", problems_count, if is_pl { "problem(ów)" } else { "problem(s)" })
                     };
 
                     if ui.button(problems_label).clicked() {
@@ -1413,13 +1936,10 @@ impl eframe::App for FlatronixEditor {
                     }
 
                     ui.separator();
-                    ui.label("Ctrl+S | Ctrl+N | Ctrl+Z | Ctrl+Y");
+                    ui.label("Ctrl+S | Ctrl+N | Ctrl+Z | Ctrl+Y | Ctrl+F");
                 });
             });
         });
-
-
-        // Process tab actions
 
         if close_current && self.active_tab < self.tabs.len() {
             tab_to_close = Some(self.active_tab);
@@ -1488,12 +2008,11 @@ impl eframe::App for FlatronixEditor {
             self.create_template(template);
         }
 
-
-        // Main editor area
         {
             let active_tab = self.active_tab;
             let syntax_set = &self.syntax_set;
             let theme = &self.theme;
+            let search_query = &self.search_query;
 
             egui::CentralPanel::default().show(ctx, |ui| {
                 if let Some(tab) = self.tabs.get_mut(active_tab) {
@@ -1503,21 +2022,19 @@ impl eframe::App for FlatronixEditor {
                         .unwrap_or("txt")
                         .to_lowercase();
 
-                    // ⚡ Cache: regenerate layout only when content changes
                     let needs_regen = match &tab.cached_layout {
-                        Some((cached_content, _)) => *cached_content != tab.content,
+                        Some((cached_content, cached_query, _)) => *cached_content != tab.content || *cached_query != *search_query,
                         None => true,
                     };
 
                     if needs_regen {
-                        let mut layout = highlight_code(syntax_set, theme, &tab.content, &ext);
-                        layout.wrap.max_width = f32::INFINITY; // 🚫 No word wrap!
-                        tab.cached_layout = Some((tab.content.clone(), layout));
+                        let mut layout = highlight_code(syntax_set, theme, &tab.content, &ext, search_query);
+                        layout.wrap.max_width = f32::INFINITY;
+                        tab.cached_layout = Some((tab.content.clone(), search_query.clone(), layout));
                     }
 
-                    let layout_clone = tab.cached_layout.as_ref().unwrap().1.clone();
+                    let layout_clone = tab.cached_layout.as_ref().unwrap().2.clone();
 
-                    // Line numbers
                     let line_count = tab.content.lines().count().max(1);
                     let mut line_numbers = (1..=line_count)
                         .map(|n| format!("{:>4}", n))
@@ -1564,19 +2081,81 @@ impl eframe::App for FlatronixEditor {
                         });
                 } else {
                     ui.centered_and_justified(|ui| {
-                        ui.label("No open files. Click File tab");
+                        ui.label(if is_pl { "Brak otwartych plików." } else { "No open files. Click File tab" });
                     });
                 }
             });
         }
 
-        // Auto save session
         self.save_session();
     }
 }
 
+fn build_dir_tree(dir: &Path) -> Vec<CachedDirNode> {
+    let mut res = vec![];
+    if let Ok(entries) = fs::read_dir(dir) {
+        let mut entries: Vec<_> = entries.filter_map(|e| e.ok()).collect();
+        entries.sort_by_key(|e| {
+            let path = e.path();
+            (!path.is_dir(), e.file_name())
+        });
 
-// Check code problems
+        for entry in entries {
+            let path = entry.path();
+            let file_name = entry.file_name().to_string_lossy().to_string();
+
+            if file_name.starts_with('.') || file_name == "target" || file_name == "node_modules" {
+                continue;
+            }
+
+            let is_dir = path.is_dir();
+            let children = if is_dir {
+                build_dir_tree(&path)
+            } else {
+                vec![]
+            };
+
+            res.push(CachedDirNode {
+                path,
+                name: file_name,
+                is_dir,
+                children,
+            });
+        }
+    }
+    res
+}
+
+fn render_cached_dir_tree(
+    ui: &mut egui::Ui,
+    nodes: &[CachedDirNode],
+    icons: &HashMap<String, egui::TextureHandle>,
+    open_file: &mut Option<PathBuf>,
+) {
+    for node in nodes {
+        if node.is_dir {
+            egui::CollapsingHeader::new(format!("📁 {}", node.name))
+                .id_source(&node.path)
+                .show(ui, |ui| {
+                    render_cached_dir_tree(ui, &node.children, icons, open_file);
+                });
+        } else {
+            ui.horizontal(|ui| {
+                if let Some(tex) = FlatronixEditor::get_icon_for_file(icons, &node.name) {
+                    ui.add(egui::Image::new(egui::load::SizedTexture::new(
+                        tex.id(),
+                        egui::vec2(14.0, 14.0),
+                    )));
+                } else {
+                    ui.label("📄");
+                }
+                if ui.selectable_label(false, &node.name).clicked() {
+                    *open_file = Some(node.path.clone());
+                }
+            });
+        }
+    }
+}
 
 fn check_code_problems(content: &str, ext: &str) -> Vec<CodeProblem> {
     let mut problems = vec![];
@@ -1631,7 +2210,6 @@ fn check_code_problems(content: &str, ext: &str) -> Vec<CodeProblem> {
             }
 
             if !in_string_double && !in_string_single {
-                // Check line comment
                 let mut found_line_comment = false;
 
                 for marker in info.line {
@@ -1651,7 +2229,6 @@ fn check_code_problems(content: &str, ext: &str) -> Vec<CodeProblem> {
                     break;
                 }
 
-                // Check block comment start
                 if let Some((start, _)) = info.block {
                     let start_chars: Vec<char> = start.chars().collect();
 
@@ -1666,7 +2243,6 @@ fn check_code_problems(content: &str, ext: &str) -> Vec<CodeProblem> {
                     }
                 }
 
-                // Check brackets
                 match ch {
                     '(' | '[' | '{' => {
                         stack.push((ch, line_num));
@@ -1724,9 +2300,6 @@ fn check_code_problems(content: &str, ext: &str) -> Vec<CodeProblem> {
 
     problems
 }
-
-
-// Comment syntax
 
 struct CommentInfo {
     line: &'static [&'static str],
@@ -1789,23 +2362,46 @@ fn comment_info(ext: &str) -> CommentInfo {
     }
 }
 
-
-// Syntax highlighting
-
-fn append_gray(job: &mut egui::text::LayoutJob, text: &str) {
-    if text.is_empty() {
+fn append_with_search(
+    job: &mut egui::text::LayoutJob,
+    text: &str,
+    format: egui::TextFormat,
+    search_query: &str,
+) {
+    if search_query.is_empty() {
+        job.append(text, 0.0, format);
         return;
     }
 
-    job.append(
-        text,
-        0.0,
-        egui::TextFormat {
-            font_id: egui::FontId::new(14.0, egui::FontFamily::Monospace),
-            color: egui::Color32::from_rgb(128, 128, 128),
-            ..Default::default()
-        },
-    );
+    let lower_text = text.to_lowercase();
+    let lower_query = search_query.to_lowercase();
+
+    let mut last_idx = 0;
+    for (idx, _) in lower_text.match_indices(&lower_query) {
+        if idx > last_idx {
+            job.append(&text[last_idx..idx], 0.0, format.clone());
+        }
+        let mut highlight_format = format.clone();
+        highlight_format.background = egui::Color32::from_rgb(200, 200, 50);
+        highlight_format.color = egui::Color32::BLACK;
+        job.append(&text[idx..idx + search_query.len()], 0.0, highlight_format);
+        last_idx = idx + search_query.len();
+    }
+    if last_idx < text.len() {
+        job.append(&text[last_idx..], 0.0, format);
+    }
+}
+
+fn append_gray(job: &mut egui::text::LayoutJob, text: &str, search_query: &str) {
+    if text.is_empty() {
+        return;
+    }
+    let format = egui::TextFormat {
+        font_id: egui::FontId::new(14.0, egui::FontFamily::Monospace),
+        color: egui::Color32::from_rgb(128, 128, 128),
+        ..Default::default()
+    };
+    append_with_search(job, text, format, search_query);
 }
 
 fn append_syntect(
@@ -1814,6 +2410,7 @@ fn append_syntect(
     theme: &Theme,
     text: &str,
     ext: &str,
+    search_query: &str,
 ) {
     if text.is_empty() {
         return;
@@ -1834,28 +2431,21 @@ fn append_syntect(
                         style.foreground.g,
                         style.foreground.b,
                     );
-
-                    job.append(
-                        chunk,
-                        0.0,
-                        egui::TextFormat {
-                            font_id: egui::FontId::new(14.0, egui::FontFamily::Monospace),
-                            color,
-                            ..Default::default()
-                        },
-                    );
+                    let format = egui::TextFormat {
+                        font_id: egui::FontId::new(14.0, egui::FontFamily::Monospace),
+                        color,
+                        ..Default::default()
+                    };
+                    append_with_search(job, chunk, format, search_query);
                 }
             }
             Err(_) => {
-                job.append(
-                    line,
-                    0.0,
-                    egui::TextFormat {
-                        font_id: egui::FontId::new(14.0, egui::FontFamily::Monospace),
-                        color: egui::Color32::WHITE,
-                        ..Default::default()
-                    },
-                );
+                let format = egui::TextFormat {
+                    font_id: egui::FontId::new(14.0, egui::FontFamily::Monospace),
+                    color: egui::Color32::WHITE,
+                    ..Default::default()
+                };
+                append_with_search(job, line, format, search_query);
             }
         }
     }
@@ -1955,6 +2545,7 @@ fn highlight_code(
     theme: &Theme,
     code: &str,
     ext: &str,
+    search_query: &str,
 ) -> egui::text::LayoutJob {
     let mut job = egui::text::LayoutJob::default();
     let info = comment_info(ext);
@@ -1968,15 +2559,15 @@ fn highlight_code(
                 if let Some((_, end)) = info.block {
                     if let Some(pos) = rest.find(end) {
                         let end_pos = pos + end.len();
-                        append_gray(&mut job, &rest[..end_pos]);
+                        append_gray(&mut job, &rest[..end_pos], search_query);
                         rest = &rest[end_pos..];
                         in_block = false;
                     } else {
-                        append_gray(&mut job, rest);
+                        append_gray(&mut job, rest, search_query);
                         rest = "";
                     }
                 } else {
-                    append_gray(&mut job, rest);
+                    append_gray(&mut job, rest, search_query);
                     rest = "";
                     in_block = false;
                 }
@@ -1989,34 +2580,34 @@ fn highlight_code(
                 match (line_comment, block_start) {
                     (Some(lp), Some(bp)) if bp < lp => {
                         if bp > 0 {
-                            append_syntect(&mut job, syntax_set, theme, &rest[..bp], ext);
+                            append_syntect(&mut job, syntax_set, theme, &rest[..bp], ext, search_query);
                         }
 
                         let (start, _) = info.block.unwrap();
-                        append_gray(&mut job, &rest[bp..bp + start.len()]);
+                        append_gray(&mut job, &rest[bp..bp + start.len()], search_query);
                         rest = &rest[bp + start.len()..];
                         in_block = true;
                     }
                     (Some(lp), _) => {
                         if lp > 0 {
-                            append_syntect(&mut job, syntax_set, theme, &rest[..lp], ext);
+                            append_syntect(&mut job, syntax_set, theme, &rest[..lp], ext, search_query);
                         }
 
-                        append_gray(&mut job, &rest[lp..]);
+                        append_gray(&mut job, &rest[lp..], search_query);
                         rest = "";
                     }
                     (None, Some(bp)) => {
                         if bp > 0 {
-                            append_syntect(&mut job, syntax_set, theme, &rest[..bp], ext);
+                            append_syntect(&mut job, syntax_set, theme, &rest[..bp], ext, search_query);
                         }
 
                         let (start, _) = info.block.unwrap();
-                        append_gray(&mut job, &rest[bp..bp + start.len()]);
+                        append_gray(&mut job, &rest[bp..bp + start.len()], search_query);
                         rest = &rest[bp + start.len()..];
                         in_block = true;
                     }
                     (None, None) => {
-                        append_syntect(&mut job, syntax_set, theme, rest, ext);
+                        append_syntect(&mut job, syntax_set, theme, rest, ext, search_query);
                         rest = "";
                     }
                 }
@@ -2026,9 +2617,6 @@ fn highlight_code(
 
     job
 }
-
-
-// Language name
 
 fn language_name(ext: &str) -> &'static str {
     match ext {
@@ -2049,30 +2637,23 @@ fn language_name(ext: &str) -> &'static str {
     }
 }
 
-
-// Fonts
-
 fn setup_fonts(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
-
 
     fonts.font_data.clear();
     fonts.families.clear();
 
-    // Load Segoe UI
     if let Ok(data) = fs::read("C:/Windows/Fonts/segoeui.ttf") {
         fonts
             .font_data
             .insert("segoe_ui".to_owned(), egui::FontData::from_owned(data));
     }
 
-
     if let Ok(data) = fs::read("C:/Windows/Fonts/seguiemj.ttf") {
         fonts
             .font_data
             .insert("segoe_ui_emoji".to_owned(), egui::FontData::from_owned(data));
     }
-
 
     if let Ok(data) = fs::read("C:/Windows/Fonts/seguisym.ttf") {
         fonts
@@ -2086,7 +2667,6 @@ fn setup_fonts(ctx: &egui::Context) {
             .insert("code_font".to_owned(), egui::FontData::from_owned(data));
     }
 
-    // Build families
     let mut proportional: Vec<String> = vec![];
     let mut monospace: Vec<String> = vec![];
 
@@ -2135,9 +2715,6 @@ fn setup_fonts(ctx: &egui::Context) {
     ctx.set_fonts(fonts);
 }
 
-
-// Window icon
-
 fn load_window_icon() -> Option<egui::IconData> {
     if let Ok(img) = image::open("icon.ico") {
         let width = img.width();
@@ -2153,9 +2730,6 @@ fn load_window_icon() -> Option<egui::IconData> {
         None
     }
 }
-
-
-// Main
 
 fn main() -> eframe::Result<()> {
     let icon = load_window_icon();
