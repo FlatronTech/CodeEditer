@@ -1,7 +1,7 @@
 
 ![CodeEditer preview](screenshot.png)
 
-![Rust](https://img.shields.io/badge/csharp-%23000000.svg?style=for-the-badge&logo=csharp&logoColor=white)
+![C#](https://img.shields.io/badge/C#-%23000000.svg?style=for-the-badge&logo=C#&logoColor=white)
 ![Version](https://img.shields.io/badge/version-2.0-green.svg?style=for-the-badge)
 ![License](https://img.shields.io/badge/license-GPL--3.0-blue.svg?style=for-the-badge)
 
@@ -25,4 +25,5 @@ This project is licensed under the **GPL-3.0 License**. Check the `LICENSE` file
 # 🖥️ Needed
 
 OS: ``Windows Vista or Newer``
+
 .NET Framework: ``4.5.2``
