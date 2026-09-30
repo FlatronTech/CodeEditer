@@ -22,8 +22,8 @@ This project is licensed under the **GPL-3.0 License**. Check the `LICENSE` file
 
 ============
 
-# 🖥️ Needed
+# 🖥️ Requirements
 
 OS: ``Windows Vista or Newer``
 
-.NET Framework: ``4.5.2``
+.NET Framework: ``4.5.2 or newer``
