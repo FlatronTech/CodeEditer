@@ -1,7 +1,7 @@
 
 ![CodeEditer preview](screenshot.png)
 
-![C#](https://img.shields.io/badge/c%23-%23239120.svg?style=for-the-badge&logo=csharp&logoColor=white)
+![C#](https://img.shields.io/badge/C%23-512BD4?style=for-the-badge&logo=c-sharp&logoColor=white)
 ![Version](https://img.shields.io/badge/version-2.0-green.svg?style=for-the-badge)
 ![License](https://img.shields.io/badge/license-GPL--3.0-blue.svg?style=for-the-badge)
 
