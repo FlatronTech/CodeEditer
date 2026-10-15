@@ -28,10 +28,10 @@ OS: ``Windows Vista or Newer``
 
 | Operating System | Compatibility | Notes |
 |---|---|---|
-| Windows XP SP3 | ❌ Unsupported | Requires .NET Framework 4.5.2 |
-| Windows Vista | ✅ Supported | Requires .NET Framework 4.5.2 |
-| Windows 7 | ✅ Supported | Requires .NET Framework 4.5.2 |
-| Windows 8 / 8.1 | ✅ Supported | Discord RPC is disabled |
-| Windows 10 | ✅ Supported | Full feature support |
-| Windows 11 | ✅ Supported | Full feature support |
+| Windows XP SP3 | ❓ Not Tested | .NET Framework 4.5.2 and One Core API|
+| Windows Vista | ❓ Not Tested yet | .NET Framework 4.5.2 is last supported yet |
+| Windows 7 | ✅ Supported | Everything works|
+| Windows 8 / 8.1 | ✅ Supported | - |
+| Windows 10 | ✅ Supported | - |
+| Windows 11 | ✅ Supported | - |
 | Linux | ⚠️ Experimental | Can run through Wine, but is not officially supported |
