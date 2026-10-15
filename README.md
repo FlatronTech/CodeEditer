@@ -2,7 +2,7 @@
 ![CodeEditer preview](screenshot.png)
 
 ![C#](https://img.shields.io/badge/C%23-512BD4?style=for-the-badge&logo=dotnet&logoColor=white)
-![Version](https://img.shields.io/badge/version-2.0-green.svg?style=for-the-badge)
+![Version](https://img.shields.io/badge/version-3.0-green.svg?style=for-the-badge)
 ![License](https://img.shields.io/badge/license-GPL--3.0-blue.svg?style=for-the-badge)
 
 CodeEditer is an open source lightweight code editor for Windows.
@@ -18,12 +18,12 @@ CodeEditer is an open source lightweight code editor for Windows.
 
 This project is licensed under the **GPL-3.0 License**. Check the `LICENSE` file for more information.
 
-## ⚙️ Dependences
-
-============
-
 # 🖥️ Requirements
 
 OS: ``Windows Vista or Newer``
 
 .NET Framework: ``4.5.2 or newer``
+
+# 📊 Compatibility table
+
+<table></table>
