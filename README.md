@@ -3,7 +3,7 @@
 
 ![C#](https://img.shields.io/badge/C%23-512BD4?style=for-the-badge&logo=dotnet&logoColor=white)
 ![Version](https://img.shields.io/badge/version-3.0-green.svg?style=for-the-badge)
-![License](https://img.shields.io/badge/license-GPL--3.0-blue.svg?style=for-the-badge)
+![License](https://img.shields.io/badge/license-GPL--4.0-blue.svg?style=for-the-badge)
 
 CodeEditer is an open source lightweight code editor for Windows.
 
